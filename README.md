@@ -6,4 +6,6 @@ main buiding idea of the encoder/decoder architecture is taken from this paper: 
 
 VAS data van be downloaded from 
 
-
+cd ./data
+# ~7GB dowloading only spectrograms
+bash ./download_vas_features.sh
