@@ -12,3 +12,4 @@ cd ./data
 bash ./download_vas_features.sh
 
 ```
+from models please use big_model_attn_gan.py. This one works more less good. Takes very long to train though
