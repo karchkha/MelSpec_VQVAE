@@ -12,7 +12,7 @@ cd ./data
 bash ./download_vas_features.sh
 
 ```
-from models please use big_model_attn_gan.py. This one works more less good. Takes very long to train though
+from models please use big_model_attn_gan.py. This one works more-less well. Takes very long to train though.
 
 
-Pllease download pretrained vocoder from: https://github.com/v-iashin/SpecVQGAN/tree/main/vocoder/logs/vggsound and put in in vocoder/logs/vggsound folder
+Please download pretrained vocoder from: https://github.com/v-iashin/SpecVQGAN/tree/main/vocoder/logs/vggsound and put in in vocoder/logs/vggsound folder
