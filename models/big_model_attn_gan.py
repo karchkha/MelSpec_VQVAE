@@ -6,7 +6,7 @@ import functools
 
 
 class VectorQuantizer(nn.Module):
-    def __init__(self, num_embeddings, embedding_dim, commitment_cost):
+    def __init__(self, num_embeddings, embedding_dim, commitment_cost, noise_sigma = 0):
         super(VectorQuantizer, self).__init__()
         
         self._embedding_dim = embedding_dim
@@ -15,6 +15,8 @@ class VectorQuantizer(nn.Module):
         self._embedding = nn.Embedding(self._num_embeddings, self._embedding_dim)
         self._embedding.weight.data.uniform_(-1/self._num_embeddings, 1/self._num_embeddings)
         self._commitment_cost = commitment_cost
+        
+        self._noise_sigma = noise_sigma
 
     def forward(self, inputs):
         # convert inputs from BCHW -> BHWC
@@ -28,9 +30,17 @@ class VectorQuantizer(nn.Module):
         distances = (torch.sum(flat_input**2, dim=1, keepdim=True) 
                     + torch.sum(self._embedding.weight**2, dim=1)
                     - 2 * torch.matmul(flat_input, self._embedding.weight.t()))
+
             
         # Encoding
         encoding_indices = torch.argmin(distances, dim=1).unsqueeze(1) #this coresponds to "min_encoding_indices"
+        
+        # Noise injection not used currently but might work some time
+        if self.training and self._noise_sigma>0:
+            # Add noise
+            noise = torch.normal(mean=0, std=self._noise_sigma, size=encoding_indices.size(), device=inputs.device).int()
+            encoding_indices += noise
+            encoding_indices = torch.clamp(encoding_indices, min=0, max=self._num_embeddings-1)
 
 
         encodings = torch.zeros(encoding_indices.shape[0], self._num_embeddings, device=inputs.device)
@@ -523,12 +533,20 @@ import pytorch_lightning as pl
 class LitVQVAE(pl.LightningModule):
     def __init__(self, 
                  #num_hiddens, num_residual_layers, num_residual_hiddens, 
-                 num_embeddings, embedding_dim, commitment_cost,
-                 disc_start, codebook_weight=1.0,
-                 disc_num_layers=3, disc_in_channels=3, disc_factor=1.0, disc_weight=1.0,
-                 use_actnorm=False, disc_conditional=False,
-                 disc_ndf=64, min_adapt_weight=0.0, max_adapt_weight=1e4,
-                 learning_rate = 1e-3):
+                 num_embeddings, embedding_dim, commitment_cost, disc_start, 
+                 codebook_weight=1.0,
+                 disc_num_layers=3, 
+                 disc_in_channels=3, 
+                 disc_factor=1.0, 
+                 disc_weight=1.0,
+                 use_actnorm=False, 
+                 disc_conditional=False,
+                 disc_ndf=64, 
+                 min_adapt_weight=0.0, 
+                 max_adapt_weight=1e4,
+                 learning_rate = 1e-3,
+                 noise_sigma = 0,
+                 cd_rand_res = False):
         super(LitVQVAE, self).__init__()
         
         self.num_embeddings = num_embeddings
@@ -547,7 +565,7 @@ class LitVQVAE(pl.LightningModule):
 
 
         self._vq_vae = VectorQuantizer(num_embeddings, embedding_dim,
-                                           commitment_cost)
+                                           commitment_cost, noise_sigma = noise_sigma)
         self._decoder = Decoder( ch = ch, 
                   out_ch = out_ch, 
                   ch_mult=ch_mult, 
@@ -564,6 +582,8 @@ class LitVQVAE(pl.LightningModule):
         self.post_quant_conv = torch.nn.Conv2d(embedding_dim, z_channels, 1)
 
         self.counts = [0 for _ in range(self.num_embeddings)]
+        self.counts_train = [0 for _ in range(self.num_embeddings)]
+        self.x = 0.0
         
         self.learning_rate = learning_rate
         
@@ -585,6 +605,8 @@ class LitVQVAE(pl.LightningModule):
         self.disc_conditional = disc_conditional
         self.min_adapt_weight = min_adapt_weight
         self.max_adapt_weight = max_adapt_weight
+        
+        self.cd_rand_res = cd_rand_res
 
     def encode(self, x):
         h = self._encoder(x) 
@@ -611,10 +633,12 @@ class LitVQVAE(pl.LightningModule):
         loss, quantized, info = self._vq_vae(z)
         
         x_recon = self.decode(quantized)
-
+        
         # this is for controling if we use codebook well
         if not self.training:
             self.counts = [info[2].squeeze().tolist().count(i) + self.counts[i] for i in range(self.num_embeddings)]
+        if self.training:    
+            self.counts_train = [info[2].squeeze().tolist().count(i) + self.counts_train[i] for i in range(self.num_embeddings)]
 
         return loss, x_recon, info
 
@@ -723,32 +747,51 @@ class LitVQVAE(pl.LightningModule):
     #     self.log("train_loss", loss, prog_bar=True, logger=True, on_step=True, on_epoch=True)
     #     # self.log("train_loss_alt", loss_alt, prog_bar=True, logger=True, on_step=True, on_epoch=True)
     #     return loss
-        
+    
+    def on_train_epoch_start(self):
+        self.counts_train = [0 for _ in range(self.num_embeddings)]
+    
     def training_step(self, batch, batch_idx, optimizer_idx):
-
-        x = self.get_input(batch)
-        qloss, xrec, _ = self(x)
+        
+        self.x = self.get_input(batch)
+        qloss, xrec, _ = self(self.x)
 
         if optimizer_idx == 0:
             # autoencode
-            aeloss, log_dict_ae = self.loss(qloss, x, xrec, optimizer_idx, self.global_step,
+            aeloss, log_dict_ae = self.loss(qloss, self.x, xrec, optimizer_idx, self.global_step,
                                             last_layer=self.get_last_layer(), split="train")
 
             self.log("train/aeloss", aeloss, prog_bar=True, logger=True, on_step=True, on_epoch=True)
             self.log("learning_rate", self.learning_rate, prog_bar=False, logger=True, on_step=True, on_epoch=True)
             self.log_dict(log_dict_ae, prog_bar=False, logger=True, on_step=True, on_epoch=True)
             
-            return aeloss   #, log_dict_ae
+            return aeloss #, log_dict_ae
 
         if optimizer_idx == 1:
             # discriminator
-            discloss, log_dict_disc = self.loss(qloss, x, xrec, optimizer_idx, self.global_step,
+            discloss, log_dict_disc = self.loss(qloss, self.x, xrec, optimizer_idx, self.global_step,
                                             last_layer=self.get_last_layer(), split="train")
             
             self.log("train/discriminator_loss", discloss, prog_bar=True, logger=True, on_step=True, on_epoch=True)
             self.log_dict(log_dict_disc, prog_bar=False, logger=True, on_step=True, on_epoch=True)
             
             return discloss # log_dict_disc #,  
+        
+        
+    def training_epoch_end(self, outs):
+        if self.cd_rand_res:
+            batch = self.x
+    #         print(f'Training Epoch counts: {self.counts_train}')
+            with torch.no_grad():
+                z = self.encode(batch)
+                _, quantized, _ = self._vq_vae(z)
+                self.codebook_random_reset(usage = self.counts_train, 
+                                           vqOut = quantized, 
+                                           codebook = self._vq_vae._embedding.weight, 
+                                           threshold = 1)              
+            self.counts_train = [0 for _ in range(self.num_embeddings)]
+
+
             
     # def validation_step(self, batch, batch_idx):
 
@@ -761,6 +804,10 @@ class LitVQVAE(pl.LightningModule):
     #     self.log("val_loss", loss, prog_bar=True, logger=True, on_step=True, on_epoch=True)
     #     return x, data_recon
     
+
+    
+    def on_validation_epoch_start(self):
+        self.counts = [0 for _ in range(self.num_embeddings)]
     
     def validation_step(self, batch, batch_idx):
 
@@ -778,15 +825,15 @@ class LitVQVAE(pl.LightningModule):
         return x, xrec#, self.log_dict
     
     def validation_epoch_end(self, val_step_output):
-        if self.global_step != 0 and sum(self.counts) > 0:
-          print(f'Previous Epoch counts: {self.counts}')
-          zero_hit_codes = len([1 for count in self.counts if count == 0])
-          used_codes = []
-          for c, count in enumerate(self.counts):
-              used_codes.extend([c] * count)
-          self.logger.experiment.add_histogram('val/code_hits', torch.tensor(used_codes), self.global_step)
-          self.logger.experiment.add_scalar('val/zero_hit_codes', zero_hit_codes, self.global_step)
-          self.counts = [0 for _ in range(self.num_embeddings)]
+#         if self.global_step != 0 and sum(self.counts) > 0:
+        print(f'validation Epoch counts: {self.counts}')
+        zero_hit_codes = len([1 for count in self.counts if count == 0])
+        used_codes = []
+        for c, count in enumerate(self.counts):
+          used_codes.extend([c] * count)
+        self.logger.experiment.add_histogram('val/code_hits', torch.tensor(used_codes), self.global_step)
+        self.logger.experiment.add_scalar('val/zero_hit_codes', zero_hit_codes, self.global_step)
+        self.counts = [0 for _ in range(self.num_embeddings)]
 
         #log images 
         self.log_images(val_step_output)
@@ -815,6 +862,23 @@ class LitVQVAE(pl.LightningModule):
 
     # def configure_optimizers(self):
     #   return torch.optim.Adam(self.parameters(), lr=self.learning_rate, amsgrad=False)   
+    
+    def codebook_random_reset(self, usage, vqOut, codebook, threshold):
+        usage = torch.tensor(usage)
+        reset_indices = usage < threshold
+        reset_indices = reset_indices.nonzero().squeeze(1)
+        print(reset_indices)
+        num_replacements = len(reset_indices)
+        vqOut = vqOut.permute(0, 2, 3, 1)
+        vqOut = vqOut.reshape(-1, vqOut.size(3))
+        num_quantized_vectors = vqOut.size(0)
+
+        selected_vq_indices = torch.randint(low=0, high=num_quantized_vectors, size=(num_replacements,))
+        with torch.no_grad():
+            codebook[reset_indices] = vqOut[selected_vq_indices]
+
+        return codebook    
+    
       
     def configure_optimizers(self):
         lr = self.learning_rate
